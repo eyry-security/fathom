@@ -8,6 +8,7 @@ description = "Rust fuzzing engine and HTTP fuzzer for the Eyry suite"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+hickory-resolver = "0.24"
 rand = "0.8"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -16,4 +17,5 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "fs"] }
 
 [dev-dependencies]
+hickory-proto = "0.24"
 tempfile = "3"

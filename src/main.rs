@@ -8,9 +8,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use fathom::http_mode::recursion_base;
 use fathom::{
-    Calibration, CircuitBreakerConfig, Criteria, Engine, EngineConfig, Event, HttpOptions,
-    HttpTarget, HttpTemplate, HumanTable, JsonlWriter, Mode, RunReport, RunStats, Selector,
-    TimeRange, WordlistSpec, build_client, compile_regexes, expand_extensions,
+    Calibration, CircuitBreakerConfig, Criteria, DnsTarget, Engine, EngineConfig, Event,
+    HttpOptions, HttpTarget, HttpTemplate, HumanTable, JsonlWriter, Mode, RunReport, RunStats,
+    Selector, TimeRange, WordlistSpec, build_client, build_resolvers, compile_regexes,
+    default_record_types, expand_extensions, handoff_line, payload_from_info,
 };
 
 const DEFAULT_MATCH_STATUSES: &str = "200-299,301,302,307,401,403,405,500";
@@ -30,6 +31,8 @@ struct Cli {
 enum Command {
     /// Fuzz an HTTP template containing FUZZ / FUZZ2.
     Http(HttpArgs),
+    /// Brute-force <word>.<domain> through DNS.
+    Dns(DnsArgs),
 }
 
 #[derive(Args)]
@@ -189,6 +192,81 @@ struct HttpArgs {
     format: OutputFormat,
 }
 
+#[derive(Args)]
+struct DnsArgs {
+    /// Base domain to brute-force below.
+    #[arg(short = 'd', long = "domain", value_name = "DOMAIN")]
+    domain: String,
+
+    /// Wordlist of subdomain labels.
+    #[arg(short = 'w', long = "wordlist", value_name = "FILE", required = true)]
+    wordlist: PathBuf,
+
+    /// Resolver IP or IP:PORT; repeatable or comma-separated. Default: system resolver.
+    #[arg(long = "resolver", value_delimiter = ',', value_name = "ADDR")]
+    resolvers: Vec<String>,
+
+    /// Also query CNAME records (A and AAAA are always queried).
+    #[arg(long = "cname")]
+    cname: bool,
+
+    /// Keep wildcard answers, tagged `wildcard: true`.
+    #[arg(long = "show-wildcards")]
+    show_wildcards: bool,
+
+    /// Random probes used to detect per-level wildcards (0 disables).
+    #[arg(long = "wildcard-probes", default_value_t = 3)]
+    wildcard_probes: usize,
+
+    /// Write kept hosts as plain Vedette-compatible lines on stdout.
+    #[arg(long = "emit-hosts")]
+    emit_hosts: bool,
+
+    /// Append this port to `--emit-hosts` lines (`host:port`).
+    #[arg(long = "emit-port", value_name = "PORT")]
+    emit_port: Option<u16>,
+
+    /// Concurrent lookups (default: 128).
+    #[arg(short = 't', long = "concurrency", default_value_t = 128)]
+    concurrency: usize,
+
+    /// Global lookups/sec cap (default: 2000).
+    #[arg(long = "rate", visible_alias = "rate-limit", value_name = "RPS")]
+    rate: Option<f64>,
+
+    /// Per-lookup timeout in seconds.
+    #[arg(long = "timeout", default_value_t = 5.0)]
+    timeout: f64,
+
+    /// Retry count per lookup (capped at 10).
+    #[arg(long = "retries", default_value_t = 2)]
+    retries: u32,
+
+    /// Pause new work when the rolling error rate reaches this ratio (0, 1].
+    #[arg(long = "error-threshold", value_name = "RATIO")]
+    error_threshold: Option<f64>,
+
+    /// Rolling error window size.
+    #[arg(long = "error-window", default_value_t = 50)]
+    error_window: usize,
+
+    /// Minimum samples before the circuit breaker can open.
+    #[arg(long = "error-min-samples", default_value_t = 20)]
+    error_min_samples: usize,
+
+    /// Circuit-breaker pause duration in seconds.
+    #[arg(long = "error-cooldown", default_value_t = 5.0)]
+    error_cooldown: f64,
+
+    /// Write JSONL events plus the stats trailer to this file.
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    /// Terminal output format.
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Human)]
+    format: OutputFormat,
+}
+
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum ModeArg {
     Pitchfork,
@@ -221,6 +299,7 @@ async fn main() {
 async fn cli() -> Result<()> {
     match Cli::parse().command {
         Command::Http(args) => run_http(args).await,
+        Command::Dns(args) => run_dns(args).await,
     }
 }
 
@@ -424,6 +503,154 @@ async fn run_http(args: HttpArgs) -> Result<()> {
     });
     if let Some(table) = &mut human {
         table.print(&stats);
+    }
+    for sink in &mut sinks {
+        sink.write(&stats)?;
+        sink.flush()?;
+    }
+
+    Ok(())
+}
+
+async fn run_dns(args: DnsArgs) -> Result<()> {
+    if args.concurrency == 0 {
+        bail!("--concurrency must be at least 1");
+    }
+    if !args.timeout.is_finite() || args.timeout <= 0.0 {
+        bail!("--timeout must be greater than 0");
+    }
+    let rate = args.rate.unwrap_or(2000.0);
+    if !rate.is_finite() || rate <= 0.0 {
+        bail!("--rate must be greater than 0");
+    }
+    if args.emit_hosts && args.format == OutputFormat::Jsonl && args.output.is_none() {
+        bail!("--emit-hosts cannot share stdout with --format jsonl; write JSONL with -o");
+    }
+
+    let domain = args
+        .domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if domain.is_empty() {
+        bail!("--domain cannot be empty");
+    }
+
+    let circuit_breaker = match args.error_threshold {
+        Some(threshold) => {
+            if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+                bail!("--error-threshold must be in (0, 1]");
+            }
+            if !args.error_cooldown.is_finite() || args.error_cooldown <= 0.0 {
+                bail!("--error-cooldown must be greater than 0");
+            }
+            Some(CircuitBreakerConfig {
+                window: args.error_window.max(1),
+                error_threshold: threshold,
+                min_samples: args.error_min_samples.max(1),
+                cooldown: Duration::from_secs_f64(args.error_cooldown),
+            })
+        }
+        None => None,
+    };
+
+    let engine = Engine::new(EngineConfig {
+        concurrency: args.concurrency,
+        rate_limit: Some(rate),
+        timeout: Duration::from_secs_f64(args.timeout),
+        retries: args.retries.min(10),
+        retry_base_delay: Duration::from_millis(100),
+        circuit_breaker,
+    });
+
+    let resolvers = build_resolvers(&args.resolvers)?;
+    let mut target = DnsTarget::new(resolvers, domain, default_record_types(args.cname));
+    target.set_show_wildcards(args.show_wildcards);
+    if args.wildcard_probes > 0 {
+        let wildcards = target.detect_wildcards(&engine, args.wildcard_probes).await;
+        target.set_wildcards(wildcards);
+    }
+
+    let spec = WordlistSpec::new(args.wordlist.clone(), None, Mode::Clusterbomb);
+
+    let mut sinks: Vec<JsonlWriter<Box<dyn Write>>> = Vec::new();
+    if args.format == OutputFormat::Jsonl {
+        sinks.push(JsonlWriter::new(Box::new(
+            BufWriter::new(std::io::stdout()),
+        )));
+    }
+    if let Some(path) = &args.output {
+        let file = File::create(path)
+            .with_context(|| format!("cannot create output file {}", path.display()))?;
+        sinks.push(JsonlWriter::new(Box::new(BufWriter::new(file))));
+    }
+    let mut human = (args.format == OutputFormat::Human && !args.emit_hosts).then(HumanTable::new);
+    let mut host_lines = args.emit_hosts.then(|| BufWriter::new(std::io::stdout()));
+
+    let words = spec
+        .iter()
+        .with_context(|| format!("cannot open wordlist {}", spec.first.display()))?;
+
+    let mut output_error: Option<anyhow::Error> = None;
+    let report = engine
+        .run(
+            words,
+            &target,
+            &Selector::default(),
+            &Calibration::default(),
+            |event| {
+                if output_error.is_some() {
+                    return;
+                }
+                if let Event::Result { info, .. } = &event {
+                    if let Some(writer) = host_lines.as_mut() {
+                        if let Some(payload) = payload_from_info(info) {
+                            if let Err(error) =
+                                writeln!(writer, "{}", handoff_line(&payload.host, args.emit_port))
+                            {
+                                output_error = Some(anyhow::Error::new(error));
+                                return;
+                            }
+                        }
+                    }
+                }
+                if let Some(table) = &mut human {
+                    table.print(&event);
+                }
+                for sink in &mut sinks {
+                    if let Err(error) = sink.write(&event) {
+                        output_error = Some(anyhow::Error::new(error));
+                        break;
+                    }
+                }
+            },
+        )
+        .await?;
+
+    if let Some(error) = output_error {
+        return Err(error).context("cannot write output");
+    }
+    if let Some(writer) = host_lines.as_mut() {
+        writer.flush().context("cannot flush host output")?;
+    }
+
+    let stats = Event::stats(&report);
+    if let Some(table) = &mut human {
+        table.print(&stats);
+    } else if args.emit_hosts {
+        if let Event::Stats {
+            requests,
+            errors,
+            kept,
+            filtered,
+            elapsed_ms,
+            rps,
+        } = &stats
+        {
+            eprintln!(
+                "[stats] requests={requests} errors={errors} kept={kept} filtered={filtered} elapsed_ms={elapsed_ms} rps={rps:.2}"
+            );
+        }
     }
     for sink in &mut sinks {
         sink.write(&stats)?;

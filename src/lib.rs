@@ -5,6 +5,7 @@
 //! binary subcommand.
 
 pub mod calibration;
+pub mod dns_mode;
 pub mod engine;
 pub mod http_mode;
 pub mod matcher;
@@ -13,6 +14,10 @@ pub mod types;
 pub mod wordlist;
 
 pub use calibration::Calibration;
+pub use dns_mode::{
+    AnswerKey, DnsAnswer, DnsPayload, DnsTarget, WildcardSet, build_resolvers,
+    default_record_types, handoff_line, payload_from_info,
+};
 pub use engine::{CircuitBreakerConfig, Engine, EngineConfig, RunReport, RunStats, Target};
 pub use http_mode::{HttpOptions, HttpTarget, HttpTemplate, build_client};
 pub use matcher::{Criteria, Selector, TimeRange, compile_regexes};

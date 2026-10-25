@@ -22,6 +22,14 @@ use crate::wordlist::WordSet;
 
 pub trait Target {
     fn execute(&self, words: &WordSet) -> impl Future<Output = Result<ExecResult, EngineError>>;
+
+    /// Optional transport-specific keep decision applied after the response has
+    /// passed the configured selector and calibration filters. The default
+    /// keeps every successful response, so non-HTTP targets can decide what a
+    /// meaningful result is (for DNS: non-empty, non-wildcard answer sets).
+    fn keep_result(&self, _words: &WordSet, _result: &ExecResult) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +177,8 @@ impl Engine {
                     stats.requests += u64::from(report.attempts);
                     stats.errors += u64::from(report.failed);
                     if let Ok(result) = report.result {
-                        let keep = selector.keep(&result.response)
+                        let keep = target.keep_result(&words, &result)
+                            && selector.keep(&result.response)
                             && !calibration.matches(&result.response);
                         if keep {
                             stats.kept += 1;
