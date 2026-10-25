@@ -11,7 +11,7 @@ use fathom::{
     Calibration, CircuitBreakerConfig, Criteria, DnsTarget, Engine, EngineConfig, Event,
     HttpOptions, HttpTarget, HttpTemplate, HumanTable, JsonlWriter, Mode, RunReport, RunStats,
     Selector, TimeRange, WordlistSpec, build_client, build_resolvers, compile_regexes,
-    default_record_types, expand_extensions, handoff_line, payload_from_info,
+    default_record_types, expand_extensions, payload_from_info, write_handoff_line,
 };
 
 const DEFAULT_MATCH_STATUSES: &str = "200-299,301,302,307,401,403,405,500";
@@ -606,7 +606,7 @@ async fn run_dns(args: DnsArgs) -> Result<()> {
                     if let Some(writer) = host_lines.as_mut() {
                         if let Some(payload) = payload_from_info(info) {
                             if let Err(error) =
-                                writeln!(writer, "{}", handoff_line(&payload.host, args.emit_port))
+                                write_handoff_line(writer, &payload.host, args.emit_port)
                             {
                                 output_error = Some(anyhow::Error::new(error));
                                 return;

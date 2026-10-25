@@ -124,7 +124,7 @@ impl Zone {
 
 pub struct DnsFixture {
     address: SocketAddr,
-    handle: tokio::task::JoinHandle<()>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl DnsFixture {
@@ -132,23 +132,28 @@ impl DnsFixture {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let address = socket.local_addr().unwrap();
         let zone = Arc::new(zone);
-        let handle = tokio::spawn(async move {
-            let mut buffer = [0u8; 4096];
-            loop {
-                let Ok((length, peer)) = socket.recv_from(&mut buffer).await else {
-                    break;
-                };
-                let Ok(request) = Message::from_vec(&buffer[..length]) else {
-                    continue;
-                };
-                let response = response_for(&zone, &request);
-                let Ok(bytes) = response.to_vec() else {
-                    continue;
-                };
-                let _ = socket.send_to(&bytes, peer).await;
-            }
-        });
-        Self { address, handle }
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let socket = socket.clone();
+            let zone = zone.clone();
+            handles.push(tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let Ok((length, peer)) = socket.recv_from(&mut buffer).await else {
+                        break;
+                    };
+                    let Ok(request) = Message::from_vec(&buffer[..length]) else {
+                        continue;
+                    };
+                    let response = response_for(&zone, &request);
+                    let Ok(bytes) = response.to_vec() else {
+                        continue;
+                    };
+                    let _ = socket.send_to(&bytes, peer).await;
+                }
+            }));
+        }
+        Self { address, handles }
     }
 
     pub fn address(&self) -> SocketAddr {
@@ -162,7 +167,9 @@ impl DnsFixture {
 
 impl Drop for DnsFixture {
     fn drop(&mut self) {
-        self.handle.abort();
+        for handle in &self.handles {
+            handle.abort();
+        }
     }
 }
 

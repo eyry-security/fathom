@@ -16,7 +16,7 @@ pub mod wordlist;
 pub use calibration::Calibration;
 pub use dns_mode::{
     AnswerKey, DnsAnswer, DnsPayload, DnsTarget, WildcardSet, build_resolvers,
-    default_record_types, handoff_line, payload_from_info,
+    default_record_types, handoff_line, payload_from_info, write_handoff_line,
 };
 pub use engine::{CircuitBreakerConfig, Engine, EngineConfig, RunReport, RunStats, Target};
 pub use http_mode::{HttpOptions, HttpTarget, HttpTemplate, build_client};

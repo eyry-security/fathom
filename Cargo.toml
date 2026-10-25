@@ -2,7 +2,7 @@
 name = "fathom"
 version = "0.1.0"
 edition = "2024"
-description = "Rust fuzzing engine and HTTP fuzzer for the Eyry suite"
+description = "Rust fuzzing engine, HTTP fuzzer and DNS brute-forcer for the Eyry suite"
 
 [dependencies]
 anyhow = "1"

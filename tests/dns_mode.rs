@@ -1,11 +1,12 @@
 mod dns_fixture;
 
+use std::process::Command;
 use std::time::Duration;
 
 use dns_fixture::{DnsFixture, Zone};
 use fathom::{
     Calibration, DnsTarget, Engine, EngineConfig, Event, Selector, WordSet, build_resolvers,
-    default_record_types, handoff_line, payload_from_info,
+    default_record_types, handoff_line, payload_from_info, write_handoff_line,
 };
 
 async fn engine(concurrency: usize) -> Engine {
@@ -195,10 +196,60 @@ async fn nxdomain_storm_does_not_trip_the_error_breaker() {
 
 #[test]
 fn handoff_lines_match_vedette_input_format() {
-    // Vedette's input parser accepts a bare host and host:port on stdin/files.
+    // Vedette's input parser accepts a bare host and host:port on stdin/files
+    // (src/input.rs: extract_host), skipping only empty and '#' lines.
     assert_eq!(handoff_line("admin.example.com", None), "admin.example.com");
     assert_eq!(
         handoff_line("admin.example.com", Some(8443)),
         "admin.example.com:8443"
     );
+
+    let mut output = Vec::new();
+    write_handoff_line(&mut output, "admin.example.com", None).unwrap();
+    write_handoff_line(&mut output, "api.example.com", Some(8443)).unwrap();
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "admin.example.com\napi.example.com:8443\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn emit_hosts_cli_writes_only_vedette_input_lines() {
+    let fixture = DnsFixture::start(Zone::test_zone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let wordlist = dir.path().join("subs.txt");
+    std::fs::write(&wordlist, "www\nmail\nanything\n").unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_fathom");
+    let resolver = fixture.resolver_spec();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(binary)
+            .args([
+                "dns",
+                "-d",
+                "example.test",
+                "-w",
+                wordlist.to_str().unwrap(),
+                "--resolver",
+                &resolver,
+                "--concurrency",
+                "1",
+                "--emit-hosts",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        output.status.success(),
+        "fathom failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines: Vec<_> = stdout.lines().collect();
+    lines.sort();
+    assert_eq!(lines, vec!["mail.example.test", "www.example.test"]);
+    assert!(!stdout.contains("[stats]"));
 }

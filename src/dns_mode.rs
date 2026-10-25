@@ -433,3 +433,12 @@ pub fn handoff_line(host: &str, port: Option<u16>) -> String {
         None => host.to_string(),
     }
 }
+
+/// Write one Vedette-compatible host line (including the trailing newline).
+pub fn write_handoff_line<W: std::io::Write>(
+    writer: &mut W,
+    host: &str,
+    port: Option<u16>,
+) -> std::io::Result<()> {
+    writeln!(writer, "{}", handoff_line(host, port))
+}
