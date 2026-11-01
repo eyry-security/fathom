@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -13,6 +13,8 @@ use tokio::net::UdpSocket;
 pub struct Zone {
     records: HashMap<String, Vec<Record>>,
     wildcard: Vec<Record>,
+    drop_types: HashMap<String, HashSet<RecordType>>,
+    forced_rcodes: HashMap<(String, RecordType), ResponseCode>,
 }
 
 impl Zone {
@@ -36,6 +38,25 @@ impl Zone {
 
     pub fn clear_wildcard(&mut self) {
         self.wildcard.clear();
+    }
+
+    /// Never answer queries for this name/type pair (client-side timeout).
+    pub fn drop_type(&mut self, name: &str, record_type: RecordType) {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        self.drop_types.entry(name).or_default().insert(record_type);
+    }
+
+    /// Answer this name/type with a fixed response code and no records.
+    pub fn fail_type(&mut self, name: &str, record_type: RecordType, code: ResponseCode) {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        self.forced_rcodes.insert((name, record_type), code);
+    }
+
+    fn should_drop(&self, name: &Name, record_type: RecordType) -> bool {
+        let key = name.to_ascii().trim_end_matches('.').to_ascii_lowercase();
+        self.drop_types
+            .get(&key)
+            .is_some_and(|types| types.contains(&record_type))
     }
 
     pub fn test_zone() -> Self {
@@ -86,6 +107,10 @@ impl Zone {
 
     fn answer(&self, qname: &Name, qtype: RecordType) -> (ResponseCode, Vec<Record>) {
         let key = qname.to_ascii().trim_end_matches('.').to_ascii_lowercase();
+
+        if let Some(code) = self.forced_rcodes.get(&(key.clone(), qtype)) {
+            return (*code, Vec::new());
+        }
 
         if let Some(records) = self.records.get(&key) {
             let answers = records
@@ -145,7 +170,9 @@ impl DnsFixture {
                     let Ok(request) = Message::from_vec(&buffer[..length]) else {
                         continue;
                     };
-                    let response = response_for(&zone, &request);
+                    let Some(response) = response_for(&zone, &request) else {
+                        continue;
+                    };
                     let Ok(bytes) = response.to_vec() else {
                         continue;
                     };
@@ -173,7 +200,7 @@ impl Drop for DnsFixture {
     }
 }
 
-fn response_for(zone: &Zone, request: &Message) -> Message {
+fn response_for(zone: &Zone, request: &Message) -> Option<Message> {
     let mut response = Message::new();
     response.set_id(request.id());
     response.set_message_type(MessageType::Response);
@@ -185,6 +212,9 @@ fn response_for(zone: &Zone, request: &Message) -> Message {
     let mut answers = Vec::new();
     let mut response_code = ResponseCode::NoError;
     for query in request.queries() {
+        if zone.should_drop(query.name(), query.query_type()) {
+            return None;
+        }
         response.add_query(query.clone());
         let (code, records) = zone.answer(query.name(), query.query_type());
         response_code = code;
@@ -194,5 +224,5 @@ fn response_for(zone: &Zone, request: &Message) -> Message {
     for answer in answers {
         response.add_answer(answer);
     }
-    response
+    Some(response)
 }

@@ -8,6 +8,8 @@ use fathom::{
     Calibration, DnsTarget, Engine, EngineConfig, Event, Selector, WordSet, build_resolvers,
     default_record_types, handoff_line, payload_from_info, write_handoff_line,
 };
+use hickory_proto::op::ResponseCode;
+use hickory_proto::rr::{RData, RecordType};
 
 async fn engine(concurrency: usize) -> Engine {
     Engine::new(EngineConfig {
@@ -252,4 +254,145 @@ async fn emit_hosts_cli_writes_only_vedette_input_lines() {
     lines.sort();
     assert_eq!(lines, vec!["mail.example.test", "www.example.test"]);
     assert!(!stdout.contains("[stats]"));
+}
+
+#[tokio::test]
+async fn partial_answer_survives_a_timed_out_record_type() {
+    let mut zone = Zone::test_zone();
+    zone.clear_wildcard();
+    zone.add(
+        "partial.example.test",
+        300,
+        RData::A(hickory_proto::rr::rdata::A("192.0.2.50".parse().unwrap())),
+    );
+    zone.drop_type("partial.example.test", RecordType::AAAA);
+    let fixture = DnsFixture::start(zone).await;
+    let resolvers = build_resolvers(&[fixture.resolver_spec()]).unwrap();
+    let target = DnsTarget::new(resolvers, "example.test", default_record_types(false))
+        .with_per_type_timeout(Duration::from_millis(500))
+        .with_per_type_retries(0);
+
+    let mut events = Vec::new();
+    let report = engine(4)
+        .await
+        .run(
+            words(&["partial"]).into_iter(),
+            &target,
+            &Selector::default(),
+            &Calibration::default(),
+            |event| events.push(event),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.stats.kept, 1);
+    assert_eq!(report.stats.errors, 0);
+    let payload = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Result { info, .. } => payload_from_info(info),
+            Event::Stats { .. } => None,
+        })
+        .unwrap();
+    assert!(
+        payload
+            .answers
+            .iter()
+            .any(|answer| { answer.record_type == "A" && answer.value == "192.0.2.50" })
+    );
+    assert_eq!(payload.incomplete_types, vec!["AAAA"]);
+    let aaaa = payload
+        .type_stats
+        .iter()
+        .find(|stat| stat.record_type == "AAAA")
+        .unwrap();
+    assert_eq!(aaaa.attempts, 1);
+    assert_eq!(aaaa.timeouts, 1);
+    assert_eq!(aaaa.incomplete, 1);
+
+    let totals = target.dns_stats();
+    let aaaa_totals = totals.per_type.get("AAAA").unwrap();
+    assert_eq!(aaaa_totals.timeouts, 1);
+    assert_eq!(aaaa_totals.incomplete, 1);
+    assert_eq!(totals.rcodes.get("NOERROR"), Some(&1));
+}
+
+#[tokio::test]
+async fn servfail_is_retried_per_type_and_counted() {
+    let mut zone = Zone::new();
+    zone.fail_type("fail.example.test", RecordType::A, ResponseCode::ServFail);
+    zone.fail_type(
+        "fail.example.test",
+        RecordType::AAAA,
+        ResponseCode::ServFail,
+    );
+    let fixture = DnsFixture::start(zone).await;
+    let resolvers = build_resolvers(&[fixture.resolver_spec()]).unwrap();
+    let target = DnsTarget::new(resolvers, "example.test", default_record_types(false))
+        .with_per_type_timeout(Duration::from_millis(200))
+        .with_per_type_retries(1);
+
+    let report = engine(4)
+        .await
+        .run(
+            words(&["fail"]).into_iter(),
+            &target,
+            &Selector::default(),
+            &Calibration::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+    // One candidate, not one retry of the whole candidate.
+    assert_eq!(report.stats.requests, 1);
+    assert_eq!(report.stats.errors, 1);
+
+    let totals = target.dns_stats();
+    for record_type in ["A", "AAAA"] {
+        let type_totals = totals.per_type.get(record_type).unwrap();
+        assert_eq!(type_totals.attempts, 2);
+        assert_eq!(type_totals.incomplete, 1);
+    }
+    assert_eq!(totals.rcodes.get("SERVFAIL"), Some(&2));
+}
+
+#[tokio::test]
+async fn nxdomain_and_nodata_are_negative_not_errors() {
+    let mut zone = Zone::new();
+    zone.add(
+        "a-only.example.test",
+        300,
+        RData::A(hickory_proto::rr::rdata::A("192.0.2.40".parse().unwrap())),
+    );
+    let fixture = DnsFixture::start(zone).await;
+    let resolvers = build_resolvers(&[fixture.resolver_spec()]).unwrap();
+    let target = DnsTarget::new(resolvers, "example.test", default_record_types(false))
+        .with_per_type_timeout(Duration::from_millis(200))
+        .with_per_type_retries(2);
+
+    let report = engine(4)
+        .await
+        .run(
+            words(&["a-only", "missing"]).into_iter(),
+            &target,
+            &Selector::default(),
+            &Calibration::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.stats.requests, 2);
+    assert_eq!(report.stats.errors, 0);
+    assert_eq!(report.stats.kept, 1);
+    assert_eq!(report.stats.filtered, 1);
+
+    let totals = target.dns_stats();
+    // NXDOMAIN is authoritative for the whole name: AAAA is not sent for the
+    // missing name, but it is still collected for the existing A-only name.
+    assert_eq!(totals.rcodes.get("NXDOMAIN"), Some(&1));
+    assert_eq!(totals.rcodes.get("NOERROR"), Some(&2));
+    assert_eq!(totals.per_type.get("A").unwrap().attempts, 2);
+    assert_eq!(totals.per_type.get("AAAA").unwrap().attempts, 1);
 }
