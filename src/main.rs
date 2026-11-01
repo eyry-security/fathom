@@ -226,8 +226,8 @@ struct DnsArgs {
     #[arg(long = "emit-port", value_name = "PORT")]
     emit_port: Option<u16>,
 
-    /// Concurrent DNS candidates (hard closed-loop window; default: 100).
-    #[arg(short = 't', long = "concurrency", default_value_t = 100)]
+    /// Concurrent DNS candidates (hard closed-loop window; default: 128).
+    #[arg(short = 't', long = "concurrency", default_value_t = 128)]
     concurrency: usize,
 
     /// Optional global lookups/sec cap (default: none; the window is the cap).
