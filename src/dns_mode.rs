@@ -2,22 +2,24 @@
 //!
 //! `DnsTarget` turns one word into `<word>.<domain>` and resolves the
 //! configured record types through hickory-dns. It implements the core
-//! [`Target`] trait, so DNS mode uses the same scheduler, rate limiter,
-//! per-request timeout, retries and circuit breaker as HTTP mode.
+//! [`Target`] trait. DNS mode deliberately mirrors the aiodnsbrute/c-ares
+//! model: every record-type lookup gets its own short timeout and bounded
+//! per-type retries, while the engine only supplies the closed concurrency
+//! window and an overall backstop timeout.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{
     NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts,
 };
-use hickory_resolver::error::{ResolveError, ResolveErrorKind};
+use hickory_resolver::error::ResolveErrorKind;
 use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::rr::{Name, RData, RecordType};
 use rand::Rng;
@@ -49,6 +51,49 @@ impl DnsAnswer {
     }
 }
 
+/// Per-record-type lookup accounting for one candidate.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DnsTypeStats {
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub attempts: u64,
+    pub timeouts: u64,
+    pub incomplete: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rcode: Option<String>,
+}
+
+/// Aggregate per-record-type totals for a whole DNS run.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DnsTypeTotals {
+    pub attempts: u64,
+    pub timeouts: u64,
+    pub incomplete: u64,
+}
+
+/// DNS-only additions to the JSONL stats trailer.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DnsRunStats {
+    #[serde(default)]
+    pub per_type: BTreeMap<String, DnsTypeTotals>,
+    #[serde(default)]
+    pub rcodes: BTreeMap<String, u64>,
+}
+
+impl DnsRunStats {
+    pub fn merge(&mut self, other: &DnsRunStats) {
+        for (record_type, totals) in &other.per_type {
+            let entry = self.per_type.entry(record_type.clone()).or_default();
+            entry.attempts += totals.attempts;
+            entry.timeouts += totals.timeouts;
+            entry.incomplete += totals.incomplete;
+        }
+        for (rcode, count) in &other.rcodes {
+            *self.rcodes.entry(rcode.clone()).or_insert(0) += count;
+        }
+    }
+}
+
 /// Payload carried under the `dns` key of a result event.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DnsPayload {
@@ -58,6 +103,12 @@ pub struct DnsPayload {
     pub rcode: String,
     pub wildcard: bool,
     pub answers: Vec<DnsAnswer>,
+    #[serde(default)]
+    pub type_stats: Vec<DnsTypeStats>,
+    #[serde(default)]
+    pub rcodes: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub incomplete_types: Vec<String>,
 }
 
 impl DnsPayload {
@@ -162,11 +213,18 @@ impl WildcardSet {
     }
 }
 
+const DEFAULT_PER_TYPE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_PER_TYPE_RETRIES: u32 = 2;
+
 pub struct DnsTarget {
     resolvers: Vec<TokioAsyncResolver>,
     next_resolver: AtomicUsize,
     domain: String,
     record_types: Vec<RecordType>,
+    per_type_timeout: Duration,
+    per_type_retries: u32,
+    cancel_siblings: bool,
+    totals: Mutex<DnsRunStats>,
     wildcards: RwLock<WildcardSet>,
     show_wildcards: bool,
 }
@@ -183,9 +241,30 @@ impl DnsTarget {
             next_resolver: AtomicUsize::new(0),
             domain: domain.into().trim_end_matches('.').to_string(),
             record_types,
+            per_type_timeout: DEFAULT_PER_TYPE_TIMEOUT,
+            per_type_retries: DEFAULT_PER_TYPE_RETRIES,
+            cancel_siblings: true,
+            totals: Mutex::new(DnsRunStats::default()),
             wildcards: RwLock::new(WildcardSet::default()),
             show_wildcards: false,
         }
+    }
+
+    pub fn with_per_type_timeout(mut self, timeout: Duration) -> Self {
+        self.per_type_timeout = timeout;
+        self
+    }
+
+    pub fn with_per_type_retries(mut self, retries: u32) -> Self {
+        self.per_type_retries = retries;
+        self
+    }
+
+    /// Controls whether an authoritative NXDOMAIN cancels sibling lookups.
+    /// Disabled for wildcard probes so their in-flight queries drain before
+    /// the main run starts.
+    pub fn set_cancel_siblings(&mut self, cancel: bool) {
+        self.cancel_siblings = cancel;
     }
 
     pub fn domain(&self) -> &str {
@@ -194,6 +273,20 @@ impl DnsTarget {
 
     pub fn record_types(&self) -> &[RecordType] {
         &self.record_types
+    }
+
+    pub fn dns_stats(&self) -> DnsRunStats {
+        self.totals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn reset_dns_stats(&self) {
+        *self
+            .totals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = DnsRunStats::default();
     }
 
     pub fn set_show_wildcards(&mut self, show: bool) {
@@ -256,6 +349,202 @@ impl DnsTarget {
         let label = words.first.trim_end_matches('.');
         format!("{label}.{}", self.domain)
     }
+
+    /// Resolve one record type with c-ares-like semantics: a short per-try
+    /// timeout, bounded retries, rotated resolvers, and a final outcome that
+    /// distinguishes negatives (NXDOMAIN/NODATA) from incomplete failures.
+    async fn lookup_type(
+        &self,
+        name: Name,
+        record_type: RecordType,
+        sibling_decisive: &AtomicBool,
+        mut nxdomain: tokio::sync::watch::Receiver<bool>,
+        nxdomain_tx: tokio::sync::watch::Sender<bool>,
+    ) -> TypeOutcome {
+        let max_attempts = u64::from(self.per_type_retries).saturating_add(1);
+        let mut attempts = 0u64;
+        let mut timeouts = 0u64;
+        let mut last_rcode = None;
+        let mut last_error = None;
+
+        for _ in 0..max_attempts {
+            if self.cancel_siblings && *nxdomain.borrow() {
+                // A sibling already proved NXDOMAIN before this lookup began;
+                // do not send a query or count an attempt for it.
+                return TypeOutcome {
+                    record_type,
+                    attempts,
+                    timeouts,
+                    answers: Vec::new(),
+                    rcode: None,
+                    negative: true,
+                    incomplete: false,
+                    error: None,
+                };
+            }
+            attempts += 1;
+            let resolver = self.resolver().clone();
+            let lookup = resolver.lookup(name.clone(), record_type);
+            let timed = tokio::time::timeout(self.per_type_timeout, lookup);
+            tokio::pin!(timed);
+
+            let result = if self.cancel_siblings {
+                let Some(result) = (tokio::select! {
+                    result = &mut timed => Some(result),
+                    _ = nxdomain.changed() => None,
+                }) else {
+                    // A sibling query proved the name is NXDOMAIN, so this
+                    // type cannot have data. Do not spend the rest of its 2s
+                    // window.
+                    return TypeOutcome {
+                        record_type,
+                        attempts,
+                        timeouts,
+                        answers: Vec::new(),
+                        rcode: Some(ResponseCode::NXDomain),
+                        negative: true,
+                        incomplete: false,
+                        error: None,
+                    };
+                };
+                result
+            } else {
+                timed.await
+            };
+
+            match result {
+                Err(_) => {
+                    timeouts += 1;
+                    last_error = Some(EngineError::timeout());
+                    // Another type already produced a decisive answer or
+                    // NXDOMAIN: keep this timeout as incomplete rather than
+                    // spending more 2s tries on a name that is already known.
+                    if sibling_decisive.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                Ok(Ok(lookup)) => {
+                    sibling_decisive.store(true, Ordering::Relaxed);
+                    let mut answers = Vec::new();
+                    for record in lookup.record_iter() {
+                        let Some(data) = record.data() else {
+                            continue;
+                        };
+                        let Some(value) = rdata_value(data) else {
+                            continue;
+                        };
+                        answers.push(DnsAnswer {
+                            record_type: record.record_type().to_string(),
+                            value,
+                            ttl: record.ttl(),
+                        });
+                    }
+                    return TypeOutcome {
+                        record_type,
+                        attempts,
+                        timeouts,
+                        answers,
+                        rcode: Some(ResponseCode::NoError),
+                        negative: false,
+                        incomplete: false,
+                        error: None,
+                    };
+                }
+                Ok(Err(error)) => match error.kind() {
+                    ResolveErrorKind::NoRecordsFound { response_code, .. } => {
+                        let code = *response_code;
+                        last_rcode = Some(code);
+                        match code {
+                            // NXDOMAIN and NOERROR/NODATA are ordinary negatives.
+                            ResponseCode::NXDomain | ResponseCode::NoError => {
+                                if code == ResponseCode::NXDomain {
+                                    sibling_decisive.store(true, Ordering::Relaxed);
+                                    let _ = nxdomain_tx.send(true);
+                                }
+                                return TypeOutcome {
+                                    record_type,
+                                    attempts,
+                                    timeouts,
+                                    answers: Vec::new(),
+                                    rcode: Some(code),
+                                    negative: true,
+                                    incomplete: false,
+                                    error: None,
+                                };
+                            }
+                            // SERVFAIL/REFUSED are retryable resolver failures.
+                            ResponseCode::ServFail | ResponseCode::Refused
+                                if attempts < max_attempts =>
+                            {
+                                last_error = Some(EngineError::retryable(format!(
+                                    "DNS {} for {}",
+                                    rcode_label(code),
+                                    name
+                                )));
+                            }
+                            _ => {
+                                last_error = Some(EngineError::non_retryable(format!(
+                                    "DNS {} for {}",
+                                    rcode_label(code),
+                                    name
+                                )));
+                                break;
+                            }
+                        }
+                    }
+                    ResolveErrorKind::Timeout => {
+                        timeouts += 1;
+                        last_error = Some(EngineError::timeout());
+                    }
+                    ResolveErrorKind::Io(_) | ResolveErrorKind::NoConnections => {
+                        last_error = Some(EngineError::retryable(error.to_string()));
+                    }
+                    _ => {
+                        last_error = Some(EngineError::non_retryable(error.to_string()));
+                        break;
+                    }
+                },
+            }
+        }
+
+        TypeOutcome {
+            record_type,
+            attempts,
+            timeouts,
+            answers: Vec::new(),
+            rcode: last_rcode,
+            negative: false,
+            incomplete: true,
+            error: last_error,
+        }
+    }
+
+    fn record_totals(&self, type_stats: &[DnsTypeStats], rcodes: &BTreeMap<String, u64>) {
+        let mut totals = self
+            .totals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for stat in type_stats {
+            let entry = totals.per_type.entry(stat.record_type.clone()).or_default();
+            entry.attempts += stat.attempts;
+            entry.timeouts += stat.timeouts;
+            entry.incomplete += stat.incomplete;
+        }
+        for (rcode, count) in rcodes {
+            *totals.rcodes.entry(rcode.clone()).or_insert(0) += count;
+        }
+    }
+}
+
+struct TypeOutcome {
+    record_type: RecordType,
+    attempts: u64,
+    timeouts: u64,
+    answers: Vec<DnsAnswer>,
+    rcode: Option<ResponseCode>,
+    negative: bool,
+    incomplete: bool,
+    error: Option<EngineError>,
 }
 
 impl Target for DnsTarget {
@@ -264,66 +553,90 @@ impl Target for DnsTarget {
         let name = Name::from_ascii(format!("{host}.")).map_err(|err| {
             EngineError::non_retryable(format!("invalid DNS name `{host}`: {err}"))
         })?;
-        let resolver = self.resolver().clone();
         let started = Instant::now();
+        let sibling_decisive = AtomicBool::new(false);
+        let (nxdomain_tx, nxdomain_rx) = tokio::sync::watch::channel(false);
 
-        let lookups = self.record_types.iter().copied().map(|record_type| {
-            let resolver = resolver.clone();
-            let name = name.clone();
-            async move {
-                let result = resolver.lookup(name, record_type).await;
-                (record_type, result)
-            }
-        });
+        // Give the first type (A by default) a short head start. A fast
+        // NXDOMAIN then cancels the remaining types before they add load,
+        // while slow names still query every configured record type.
+        let lookups = self
+            .record_types
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, record_type)| {
+                let name = name.clone();
+                let sibling_decisive = &sibling_decisive;
+                let nxdomain = nxdomain_rx.clone();
+                let nxdomain_tx = nxdomain_tx.clone();
+                async move {
+                    if index > 0 {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                    self.lookup_type(name, record_type, sibling_decisive, nxdomain, nxdomain_tx)
+                        .await
+                }
+            });
         let outcomes = join_all(lookups).await;
-        let elapsed = started.elapsed();
 
         let mut answers = Vec::new();
         let mut saw_answer = false;
         let mut saw_nxdomain = false;
-        let mut rcode = ResponseCode::NoError;
+        let mut any_definitive = false;
+        let mut type_stats = Vec::with_capacity(outcomes.len());
+        let mut rcodes = BTreeMap::new();
+        let mut incomplete_types = Vec::new();
+        let mut final_error = None;
 
-        for (requested, outcome) in outcomes {
-            match outcome {
-                Ok(lookup) => {
-                    if rcode == ResponseCode::NXDomain {
-                        rcode = ResponseCode::NoError;
-                    }
-                    for record in lookup.record_iter() {
-                        let Some(data) = record.data() else {
-                            continue;
-                        };
-                        let Some(value) = rdata_value(data) else {
-                            continue;
-                        };
-                        saw_answer = true;
-                        answers.push(DnsAnswer {
-                            record_type: record.record_type().to_string(),
-                            value,
-                            ttl: record.ttl(),
-                        });
-                    }
-                    if !saw_answer && requested == RecordType::A {
-                        // A valid NOERROR/NODATA response still means the name
-                        // exists; leave rcode as NOERROR.
-                    }
-                }
-                Err(error) => match error.kind() {
-                    ResolveErrorKind::NoRecordsFound { response_code, .. } => {
-                        if *response_code == ResponseCode::NXDomain {
-                            saw_nxdomain = true;
-                        } else if *response_code != ResponseCode::NoError {
-                            rcode = *response_code;
-                        }
-                    }
-                    _ => return Err(resolve_error(error)),
-                },
+        for outcome in outcomes {
+            if let Some(code) = outcome.rcode {
+                *rcodes.entry(rcode_label(code).to_string()).or_insert(0) += 1;
             }
+            if outcome.negative {
+                any_definitive = true;
+                if outcome.rcode == Some(ResponseCode::NXDomain) {
+                    saw_nxdomain = true;
+                }
+            }
+            if !outcome.answers.is_empty() {
+                any_definitive = true;
+                saw_answer = true;
+                answers.extend(outcome.answers.iter().cloned());
+            }
+            if outcome.incomplete {
+                incomplete_types.push(outcome.record_type.to_string());
+                if final_error.is_none() {
+                    final_error = outcome.error;
+                }
+            }
+            type_stats.push(DnsTypeStats {
+                record_type: outcome.record_type.to_string(),
+                attempts: outcome.attempts,
+                timeouts: outcome.timeouts,
+                incomplete: u64::from(outcome.incomplete),
+                rcode: outcome.rcode.map(|code| rcode_label(code).to_string()),
+            });
+        }
+        let elapsed = started.elapsed();
+
+        self.record_totals(&type_stats, &rcodes);
+
+        // If every record type failed (timeouts or retryable resolver errors)
+        // this candidate is a genuine error, not an empty answer.
+        if !any_definitive {
+            return Err(final_error.unwrap_or_else(|| {
+                EngineError::retryable(format!("all DNS lookups failed for {host}"))
+            }));
         }
 
-        if !saw_answer && saw_nxdomain && rcode == ResponseCode::NoError {
-            rcode = ResponseCode::NXDomain;
-        }
+        let rcode = if saw_answer {
+            ResponseCode::NoError
+        } else if saw_nxdomain {
+            ResponseCode::NXDomain
+        } else {
+            ResponseCode::NoError
+        };
 
         answers.sort_by(|a, b| {
             a.record_type
@@ -349,7 +662,15 @@ impl Target for DnsTarget {
             rcode: rcode_label(rcode).to_string(),
             wildcard,
             answers,
+            type_stats,
+            rcodes,
+            incomplete_types,
         };
+
+        // Retire the completed lookups before this candidate releases its
+        // window slot, so the next candidate cannot be admitted while the
+        // resolver is still accounting for this one.
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         Ok(ExecResult {
             response: Response::from_body(u16::from(rcode), body, elapsed),
@@ -394,16 +715,6 @@ fn rdata_value(data: &RData) -> Option<String> {
                 .to_ascii_lowercase(),
         ),
         _ => None,
-    }
-}
-
-fn resolve_error(error: ResolveError) -> EngineError {
-    match error.kind() {
-        ResolveErrorKind::Timeout => EngineError::timeout(),
-        ResolveErrorKind::Io(_) | ResolveErrorKind::NoConnections => {
-            EngineError::retryable(error.to_string())
-        }
-        _ => EngineError::non_retryable(error.to_string()),
     }
 }
 

@@ -226,35 +226,39 @@ struct DnsArgs {
     #[arg(long = "emit-port", value_name = "PORT")]
     emit_port: Option<u16>,
 
-    /// Concurrent lookups (default: 128).
+    /// Concurrent DNS candidates (hard closed-loop window; default: 128).
     #[arg(short = 't', long = "concurrency", default_value_t = 128)]
     concurrency: usize,
 
-    /// Global lookups/sec cap (default: 2000).
+    /// Optional global lookups/sec cap (default: none; the window is the cap).
     #[arg(long = "rate", visible_alias = "rate-limit", value_name = "RPS")]
     rate: Option<f64>,
 
-    /// Per-lookup timeout in seconds.
-    #[arg(long = "timeout", default_value_t = 5.0)]
+    /// Per-record-type DNS timeout in seconds (default: 2, like c-ares).
+    #[arg(long = "dns-timeout", default_value_t = 2.0)]
+    dns_timeout: f64,
+
+    /// Engine-level backstop timeout in seconds (default: 20).
+    #[arg(long = "timeout", default_value_t = 20.0)]
     timeout: f64,
 
-    /// Retry count per lookup (capped at 10).
+    /// Retry count per record type (capped at 10; default: 2, like c-ares).
     #[arg(long = "retries", default_value_t = 2)]
     retries: u32,
 
-    /// Pause new work when the rolling error rate reaches this ratio (0, 1].
+    /// Accepted for compatibility but ignored: DNS mode never runs a breaker.
     #[arg(long = "error-threshold", value_name = "RATIO")]
     error_threshold: Option<f64>,
 
-    /// Rolling error window size.
+    /// Accepted for compatibility but ignored: DNS mode never runs a breaker.
     #[arg(long = "error-window", default_value_t = 50)]
     error_window: usize,
 
-    /// Minimum samples before the circuit breaker can open.
+    /// Accepted for compatibility but ignored: DNS mode never runs a breaker.
     #[arg(long = "error-min-samples", default_value_t = 20)]
     error_min_samples: usize,
 
-    /// Circuit-breaker pause duration in seconds.
+    /// Accepted for compatibility but ignored: DNS mode never runs a breaker.
     #[arg(long = "error-cooldown", default_value_t = 5.0)]
     error_cooldown: f64,
 
@@ -519,9 +523,13 @@ async fn run_dns(args: DnsArgs) -> Result<()> {
     if !args.timeout.is_finite() || args.timeout <= 0.0 {
         bail!("--timeout must be greater than 0");
     }
-    let rate = args.rate.unwrap_or(2000.0);
-    if !rate.is_finite() || rate <= 0.0 {
-        bail!("--rate must be greater than 0");
+    if !args.dns_timeout.is_finite() || args.dns_timeout <= 0.0 {
+        bail!("--dns-timeout must be greater than 0");
+    }
+    if let Some(rate) = args.rate {
+        if !rate.is_finite() || rate <= 0.0 {
+            bail!("--rate must be greater than 0");
+        }
     }
     if args.emit_hosts && args.format == OutputFormat::Jsonl && args.output.is_none() {
         bail!("--emit-hosts cannot share stdout with --format jsonl; write JSONL with -o");
@@ -536,40 +544,57 @@ async fn run_dns(args: DnsArgs) -> Result<()> {
         bail!("--domain cannot be empty");
     }
 
-    let circuit_breaker = match args.error_threshold {
-        Some(threshold) => {
-            if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
-                bail!("--error-threshold must be in (0, 1]");
-            }
-            if !args.error_cooldown.is_finite() || args.error_cooldown <= 0.0 {
-                bail!("--error-cooldown must be greater than 0");
-            }
-            Some(CircuitBreakerConfig {
-                window: args.error_window.max(1),
-                error_threshold: threshold,
-                min_samples: args.error_min_samples.max(1),
-                cooldown: Duration::from_secs_f64(args.error_cooldown),
-            })
+    // DNS mode intentionally has no circuit breaker: aiodnsbrute's closed-loop
+    // window is the only admission control. The flags are still validated so
+    // existing invocations do not silently change meaning, but they never open
+    // a breaker here.
+    if let Some(threshold) = args.error_threshold {
+        if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+            bail!("--error-threshold must be in (0, 1]");
         }
-        None => None,
-    };
+        if !args.error_cooldown.is_finite() || args.error_cooldown <= 0.0 {
+            bail!("--error-cooldown must be greater than 0");
+        }
+    }
+    let _ = (
+        args.error_window,
+        args.error_min_samples,
+        args.error_cooldown,
+        args.error_threshold,
+    );
 
+    let retries = args.retries.min(10);
+    let dns_timeout = Duration::from_secs_f64(args.dns_timeout);
+    // The engine timeout is only a backstop: make sure it can never cut off
+    // the per-type timeout/retry budget configured above.
+    let backstop = Duration::from_secs_f64(args.timeout)
+        .max(dns_timeout.saturating_mul(retries.saturating_add(1)));
     let engine = Engine::new(EngineConfig {
         concurrency: args.concurrency,
-        rate_limit: Some(rate),
-        timeout: Duration::from_secs_f64(args.timeout),
-        retries: args.retries.min(10),
+        rate_limit: args.rate,
+        timeout: backstop,
+        // Per-record-type retries live in DnsTarget; the engine must never
+        // re-execute a whole candidate because one type failed.
+        retries: 0,
         retry_base_delay: Duration::from_millis(100),
-        circuit_breaker,
+        circuit_breaker: None,
     });
 
     let resolvers = build_resolvers(&args.resolvers)?;
-    let mut target = DnsTarget::new(resolvers, domain, default_record_types(args.cname));
+    let mut target = DnsTarget::new(resolvers, domain, default_record_types(args.cname))
+        .with_per_type_timeout(dns_timeout)
+        .with_per_type_retries(retries);
     target.set_show_wildcards(args.show_wildcards);
     if args.wildcard_probes > 0 {
+        // Let probe queries drain instead of cancelling siblings, so no
+        // probe traffic overlaps the main run.
+        target.set_cancel_siblings(false);
         let wildcards = target.detect_wildcards(&engine, args.wildcard_probes).await;
         target.set_wildcards(wildcards);
+        target.set_cancel_siblings(true);
     }
+    // Wildcard probes are not part of the run statistics.
+    target.reset_dns_stats();
 
     let spec = WordlistSpec::new(args.wordlist.clone(), None, Mode::Clusterbomb);
 
@@ -634,7 +659,8 @@ async fn run_dns(args: DnsArgs) -> Result<()> {
         writer.flush().context("cannot flush host output")?;
     }
 
-    let stats = Event::stats(&report);
+    let dns_stats = target.dns_stats();
+    let stats = Event::stats_with_dns(&report, Some(dns_stats));
     if let Some(table) = &mut human {
         table.print(&stats);
     } else if args.emit_hosts {
@@ -645,6 +671,7 @@ async fn run_dns(args: DnsArgs) -> Result<()> {
             filtered,
             elapsed_ms,
             rps,
+            ..
         } = &stats
         {
             eprintln!(

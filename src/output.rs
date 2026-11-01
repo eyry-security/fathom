@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::dns_mode::DnsRunStats;
 use crate::engine::RunReport;
 use crate::types::ExecResult;
 use crate::wordlist::{FUZZ, FUZZ2, WordSet};
@@ -48,6 +49,8 @@ pub enum Event {
         filtered: u64,
         elapsed_ms: u64,
         rps: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dns: Option<DnsRunStats>,
     },
 }
 
@@ -66,6 +69,10 @@ impl Event {
     }
 
     pub fn stats(report: &RunReport) -> Self {
+        Self::stats_with_dns(report, None)
+    }
+
+    pub fn stats_with_dns(report: &RunReport, dns: Option<DnsRunStats>) -> Self {
         Self::Stats {
             requests: report.stats.requests,
             errors: report.stats.errors,
@@ -73,6 +80,7 @@ impl Event {
             filtered: report.stats.filtered,
             elapsed_ms: millis(report.elapsed),
             rps: report.rps,
+            dns,
         }
     }
 }
@@ -166,6 +174,7 @@ impl HumanTable {
                 filtered,
                 elapsed_ms,
                 rps,
+                dns: _,
             } => {
                 println!(
                     "[stats] requests={requests} errors={errors} kept={kept} filtered={filtered} elapsed_ms={elapsed_ms} rps={rps:.2}"
