@@ -30,12 +30,31 @@ fathom dns -d example.com -w subs.txt --show-wildcards
 fathom dns -d example.com -w subs.txt --emit-hosts | vedette
 ```
 
-DNS defaults are separate from HTTP: 2000 lookups/sec cap, 5s per-lookup
-timeout, 128 concurrent lookups, A + AAAA record types. `--rate` overrides the
-cap; `--cname` adds CNAME to the query set. `--resolver` accepts an IP or
-`IP:PORT`, repeatable or comma-separated; explicit resolvers are round-robin
-rotated. With no `--resolver`, hickory-dns reads the system resolver config.
-The same engine supplies retries, circuit breaking and per-lookup timeouts.
+DNS defaults follow the aiodnsbrute/c-ares model: 128 concurrent candidates
+(a hard closed-loop window), a 2s timeout and 2 retries (3 tries) **per record
+type**, A + AAAA record types, and no rate cap or circuit breaker by default.
+`--dns-timeout` changes the per-type timeout, `--retries` changes the per-type
+retry budget, and `--timeout` is only an engine-level backstop.
+`--rate` optionally adds a global lookups/sec cap; `--cname` adds CNAME to the
+query set. `--resolver` accepts an IP or `IP:PORT`, repeatable or
+comma-separated; explicit resolvers are round-robin rotated per attempt. With
+no `--resolver`, hickory-dns reads the system resolver config.
+
+Each record type is resolved independently with its own 2s try, so a
+successful A answer is kept even if AAAA times out; timed-out types are listed
+in `dns.incomplete_types` and counted in `dns.type_stats`. NXDOMAIN and NODATA
+are ordinary negative answers (filtered, not errors). SERVFAIL/REFUSED are
+retried up to the per-type budget and counted in `dns.rcodes`; a candidate only
+counts as an engine error when every requested record type failed. The stats
+trailer gains an additive `dns` object with per-type
+`attempts`/`timeouts`/`incomplete` totals and the rcode distribution.
+
+To avoid doubling resolver load on the common negative case, the first type
+(A, or the first configured type) gets a short head start. A fast authoritative
+NXDOMAIN cancels the remaining types because a non-existent name cannot have
+AAAA/CNAME data; any other outcome (answer, NODATA, timeout) still queries
+every configured type. AAAA/CNAME are therefore still collected for every name
+that exists, and `per_type` attempt counts reflect queries actually started.
 
 ### Wildcard filtering
 
@@ -63,8 +82,8 @@ the numeric `status` (0 = NOERROR, 3 = NXDOMAIN, ...). `size`, `words` and
 fields remain meaningful. `input.FUZZ` is the wordlist label.
 
 ```json
-{"type":"result","input":{"FUZZ":"www"},"dns":{"host":"www.example.com","domain":"example.com","record_types":["A","AAAA"],"rcode":"NOERROR","wildcard":false,"answers":[{"type":"A","value":"192.0.2.10","ttl":300},{"type":"AAAA","value":"2001:db8::10","ttl":300}]},"status":0,"size":42,"words":6,"lines":2,"duration_ms":3}
-{"type":"stats","requests":100,"errors":0,"kept":4,"filtered":96,"elapsed_ms":812,"rps":123.15}
+{"type":"result","input":{"FUZZ":"www"},"dns":{"host":"www.example.com","domain":"example.com","record_types":["A","AAAA"],"rcode":"NOERROR","wildcard":false,"answers":[{"type":"A","value":"192.0.2.10","ttl":300},{"type":"AAAA","value":"2001:db8::10","ttl":300}],"type_stats":[{"type":"A","attempts":1,"timeouts":0,"incomplete":0,"rcode":"NOERROR"},{"type":"AAAA","attempts":1,"timeouts":0,"incomplete":0,"rcode":"NOERROR"}],"rcodes":{"NOERROR":2},"incomplete_types":[]},"status":0,"size":42,"words":6,"lines":2,"duration_ms":3}
+{"type":"stats","requests":100,"errors":0,"kept":4,"filtered":96,"elapsed_ms":812,"rps":123.15,"dns":{"per_type":{"A":{"attempts":100,"timeouts":0,"incomplete":0},"AAAA":{"attempts":100,"timeouts":0,"incomplete":0}},"rcodes":{"NXDOMAIN":96,"NOERROR":4}}}
 ```
 
 `dns.answers` is sorted by type then value and de-duplicated; each answer
