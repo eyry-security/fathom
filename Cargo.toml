@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "Rust fuzzing engine, HTTP fuzzer and DNS brute-forcer for the Eyry suite"
 
+[[bin]]
+name = "fathom"
+path = "src/main.rs"
+
+[[bin]]
+name = "resolver-bench"
+path = "src/bin/resolver-bench.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
