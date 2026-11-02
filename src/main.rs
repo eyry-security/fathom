@@ -219,9 +219,13 @@ struct DnsArgs {
     #[arg(long = "wildcard-probes", default_value_t = 3)]
     wildcard_probes: usize,
 
-    /// Re-query labels left incomplete after the main pass (default: off).
+    /// Re-query labels left incomplete after the main pass (default: on).
     #[arg(long = "repair-sweep")]
     repair_sweep: bool,
+
+    /// Disable the repair sweep (it runs by default).
+    #[arg(long = "no-repair-sweep")]
+    no_repair_sweep: bool,
 
     /// Concurrency for repair-sweep queries (default: 32).
     #[arg(long = "repair-concurrency", default_value_t = 32)]
@@ -243,11 +247,11 @@ struct DnsArgs {
     #[arg(long = "rate", visible_alias = "rate-limit", value_name = "RPS")]
     rate: Option<f64>,
 
-    /// Per-record-type DNS timeout in seconds (default: 2, like c-ares).
+    /// Per-record-type DNS timeout in seconds (default: 1).
     #[arg(
         long = "dns-timeout",
         visible_alias = "per-type-timeout",
-        default_value_t = 2.0
+        default_value_t = 1.0
     )]
     dns_timeout: f64,
 
@@ -255,11 +259,11 @@ struct DnsArgs {
     #[arg(long = "timeout", default_value_t = 20.0)]
     timeout: f64,
 
-    /// Retry count per record type (capped at 10; default: 2, like c-ares).
+    /// Retry count per record type (capped at 10; default: 5).
     #[arg(
         long = "retries",
         visible_alias = "per-type-retries",
-        default_value_t = 2
+        default_value_t = 5
     )]
     retries: u32,
 
@@ -320,7 +324,10 @@ async fn main() {
 async fn cli() -> Result<()> {
     match Cli::parse().command {
         Command::Http(args) => run_http(args).await,
-        Command::Dns(args) => run_dns(args).await,
+        Command::Dns(mut args) => {
+            args.repair_sweep = !args.no_repair_sweep;
+            run_dns(args).await
+        }
     }
 }
 
