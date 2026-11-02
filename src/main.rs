@@ -10,8 +10,9 @@ use fathom::http_mode::recursion_base;
 use fathom::{
     Calibration, CircuitBreakerConfig, Criteria, DnsTarget, Engine, EngineConfig, Event,
     HttpOptions, HttpTarget, HttpTemplate, HumanTable, JsonlWriter, Mode, RunReport, RunStats,
-    Selector, TimeRange, WordlistSpec, build_client, build_resolvers, compile_regexes,
-    default_record_types, expand_extensions, payload_from_info, write_handoff_line,
+    Selector, TimeRange, WordSet, WordlistSpec, build_client, build_resolvers, compile_regexes,
+    default_record_types, expand_extensions, payload_from_info, repair_sweep, result_host,
+    result_is_incomplete, write_handoff_line,
 };
 
 const DEFAULT_MATCH_STATUSES: &str = "200-299,301,302,307,401,403,405,500";
@@ -218,6 +219,14 @@ struct DnsArgs {
     #[arg(long = "wildcard-probes", default_value_t = 3)]
     wildcard_probes: usize,
 
+    /// Re-query labels left incomplete after the main pass (default: off).
+    #[arg(long = "repair-sweep")]
+    repair_sweep: bool,
+
+    /// Concurrency for repair-sweep queries (default: 32).
+    #[arg(long = "repair-concurrency", default_value_t = 32)]
+    repair_concurrency: usize,
+
     /// Write kept hosts as plain Vedette-compatible lines on stdout.
     #[arg(long = "emit-hosts")]
     emit_hosts: bool,
@@ -235,7 +244,11 @@ struct DnsArgs {
     rate: Option<f64>,
 
     /// Per-record-type DNS timeout in seconds (default: 2, like c-ares).
-    #[arg(long = "dns-timeout", default_value_t = 2.0)]
+    #[arg(
+        long = "dns-timeout",
+        visible_alias = "per-type-timeout",
+        default_value_t = 2.0
+    )]
     dns_timeout: f64,
 
     /// Engine-level backstop timeout in seconds (default: 20).
@@ -243,7 +256,11 @@ struct DnsArgs {
     timeout: f64,
 
     /// Retry count per record type (capped at 10; default: 2, like c-ares).
-    #[arg(long = "retries", default_value_t = 2)]
+    #[arg(
+        long = "retries",
+        visible_alias = "per-type-retries",
+        default_value_t = 2
+    )]
     retries: u32,
 
     /// Accepted for compatibility but ignored: DNS mode never runs a breaker.
@@ -520,6 +537,9 @@ async fn run_dns(args: DnsArgs) -> Result<()> {
     if args.concurrency == 0 {
         bail!("--concurrency must be at least 1");
     }
+    if args.repair_sweep && args.repair_concurrency == 0 {
+        bail!("--repair-concurrency must be at least 1");
+    }
     if !args.timeout.is_finite() || args.timeout <= 0.0 {
         bail!("--timeout must be greater than 0");
     }
@@ -579,6 +599,14 @@ async fn run_dns(args: DnsArgs) -> Result<()> {
         retry_base_delay: Duration::from_millis(100),
         circuit_breaker: None,
     });
+    let sweep_engine = Engine::new(EngineConfig {
+        concurrency: args.repair_concurrency.max(1),
+        rate_limit: args.rate,
+        timeout: backstop,
+        retries: 0,
+        retry_base_delay: Duration::from_millis(100),
+        circuit_breaker: None,
+    });
 
     let resolvers = build_resolvers(&args.resolvers)?;
     let mut target = DnsTarget::new(resolvers, domain, default_record_types(args.cname))
@@ -598,93 +626,154 @@ async fn run_dns(args: DnsArgs) -> Result<()> {
 
     let spec = WordlistSpec::new(args.wordlist.clone(), None, Mode::Clusterbomb);
 
-    let mut sinks: Vec<JsonlWriter<Box<dyn Write>>> = Vec::new();
+    let mut output = DnsOutput {
+        sinks: Vec::new(),
+        human: (args.format == OutputFormat::Human && !args.emit_hosts).then(HumanTable::new),
+        host_lines: args.emit_hosts.then(|| BufWriter::new(std::io::stdout())),
+        emit_port: args.emit_port,
+        found_hosts: HashSet::new(),
+        output_error: None,
+    };
     if args.format == OutputFormat::Jsonl {
-        sinks.push(JsonlWriter::new(Box::new(
+        output.sinks.push(JsonlWriter::new(Box::new(
             BufWriter::new(std::io::stdout()),
         )));
     }
     if let Some(path) = &args.output {
         let file = File::create(path)
             .with_context(|| format!("cannot create output file {}", path.display()))?;
-        sinks.push(JsonlWriter::new(Box::new(BufWriter::new(file))));
+        output
+            .sinks
+            .push(JsonlWriter::new(Box::new(BufWriter::new(file))));
     }
-    let mut human = (args.format == OutputFormat::Human && !args.emit_hosts).then(HumanTable::new);
-    let mut host_lines = args.emit_hosts.then(|| BufWriter::new(std::io::stdout()));
 
     let words = spec
         .iter()
         .with_context(|| format!("cannot open wordlist {}", spec.first.display()))?;
 
-    let mut output_error: Option<anyhow::Error> = None;
+    let mut incomplete = Vec::new();
     let report = engine
-        .run(
+        .run_observed(
             words,
             &target,
             &Selector::default(),
             &Calibration::default(),
-            |event| {
-                if output_error.is_some() {
-                    return;
-                }
-                if let Event::Result { info, .. } = &event {
-                    if let Some(writer) = host_lines.as_mut() {
-                        if let Some(payload) = payload_from_info(info) {
-                            if let Err(error) =
-                                write_handoff_line(writer, &payload.host, args.emit_port)
-                            {
-                                output_error = Some(anyhow::Error::new(error));
-                                return;
-                            }
-                        }
-                    }
-                }
-                if let Some(table) = &mut human {
-                    table.print(&event);
-                }
-                for sink in &mut sinks {
-                    if let Err(error) = sink.write(&event) {
-                        output_error = Some(anyhow::Error::new(error));
-                        break;
-                    }
+            |event| output.handle(event),
+            |words, result, _kept| {
+                if result_is_incomplete(result) {
+                    incomplete.push(words.clone());
                 }
             },
         )
         .await?;
 
-    if let Some(error) = output_error {
+    if let Some(error) = output.take_error() {
         return Err(error).context("cannot write output");
     }
-    if let Some(writer) = host_lines.as_mut() {
-        writer.flush().context("cannot flush host output")?;
-    }
 
-    let dns_stats = target.dns_stats();
+    let mut sweep_stats = None;
+    if args.repair_sweep {
+        let already_found = output.found_hosts.clone();
+        sweep_stats = Some(
+            repair_sweep(
+                &sweep_engine,
+                &target,
+                dedupe_candidates(incomplete),
+                &already_found,
+                |_, result| result_is_incomplete(result),
+                result_host,
+                |event| output.handle(event),
+            )
+            .await?,
+        );
+    }
+    if let Some(error) = output.take_error() {
+        return Err(error).context("cannot write output");
+    }
+    output.flush_hosts()?;
+
+    let mut dns_stats = target.dns_stats();
+    if let Some(sweep) = sweep_stats {
+        dns_stats.sweep = Some(sweep);
+    }
     let stats = Event::stats_with_dns(&report, Some(dns_stats));
-    if let Some(table) = &mut human {
-        table.print(&stats);
-    } else if args.emit_hosts {
-        if let Event::Stats {
-            requests,
-            errors,
-            kept,
-            filtered,
-            elapsed_ms,
-            rps,
-            ..
-        } = &stats
-        {
-            eprintln!(
-                "[stats] requests={requests} errors={errors} kept={kept} filtered={filtered} elapsed_ms={elapsed_ms} rps={rps:.2}"
-            );
-        }
-    }
-    for sink in &mut sinks {
-        sink.write(&stats)?;
-        sink.flush()?;
-    }
+    output.finish(&stats)?;
 
     Ok(())
+}
+
+struct DnsOutput {
+    sinks: Vec<JsonlWriter<Box<dyn Write>>>,
+    human: Option<HumanTable>,
+    host_lines: Option<BufWriter<std::io::Stdout>>,
+    emit_port: Option<u16>,
+    found_hosts: HashSet<String>,
+    output_error: Option<anyhow::Error>,
+}
+
+impl DnsOutput {
+    fn handle(&mut self, event: Event) {
+        if self.output_error.is_some() {
+            return;
+        }
+        if let Event::Result { info, .. } = &event {
+            if let Some(payload) = payload_from_info(info) {
+                self.found_hosts.insert(payload.host.clone());
+                if let Some(writer) = self.host_lines.as_mut() {
+                    if let Err(error) = write_handoff_line(writer, &payload.host, self.emit_port) {
+                        self.output_error = Some(anyhow::Error::new(error));
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(table) = &mut self.human {
+            table.print(&event);
+        }
+        for sink in &mut self.sinks {
+            if let Err(error) = sink.write(&event) {
+                self.output_error = Some(anyhow::Error::new(error));
+                break;
+            }
+        }
+    }
+
+    fn take_error(&mut self) -> Option<anyhow::Error> {
+        self.output_error.take()
+    }
+
+    fn flush_hosts(&mut self) -> Result<()> {
+        if let Some(writer) = self.host_lines.as_mut() {
+            writer.flush().context("cannot flush host output")?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, stats: &Event) -> Result<()> {
+        if let Some(table) = &mut self.human {
+            table.print(stats);
+        } else if self.host_lines.is_some() {
+            if let Some(line) = stats.stats_line() {
+                eprintln!("{line}");
+            }
+        }
+        for sink in &mut self.sinks {
+            sink.write(stats)?;
+            sink.flush()?;
+        }
+        Ok(())
+    }
+}
+
+fn dedupe_candidates(candidates: Vec<WordSet>) -> Vec<WordSet> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for words in candidates {
+        if seen.insert(words.first.clone()) {
+            unique.push(words);
+        }
+    }
+    unique
 }
 
 fn parse_statuses(values: &[String]) -> Result<Vec<u16>> {

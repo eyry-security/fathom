@@ -83,6 +83,33 @@ impl Event {
             dns,
         }
     }
+
+    /// One-line human/stderr summary, including repair-sweep counters when a
+    /// sweep ran.
+    pub fn stats_line(&self) -> Option<String> {
+        let Event::Stats {
+            requests,
+            errors,
+            kept,
+            filtered,
+            elapsed_ms,
+            rps,
+            dns,
+        } = self
+        else {
+            return None;
+        };
+        let mut line = format!(
+            "[stats] requests={requests} errors={errors} kept={kept} filtered={filtered} elapsed_ms={elapsed_ms} rps={rps:.2}"
+        );
+        if let Some(sweep) = dns.as_ref().and_then(|stats| stats.sweep.as_ref()) {
+            line.push_str(&format!(
+                " sweep_subset={} sweep_attempts={} sweep_recovered={} sweep_passes={}",
+                sweep.subset, sweep.attempts, sweep.recovered, sweep.passes
+            ));
+        }
+        Some(line)
+    }
 }
 
 fn input_value(words: &WordSet) -> serde_json::Value {
@@ -167,18 +194,10 @@ impl HumanTable {
                     status, size, words, lines, duration_ms, target
                 );
             }
-            Event::Stats {
-                requests,
-                errors,
-                kept,
-                filtered,
-                elapsed_ms,
-                rps,
-                dns: _,
-            } => {
-                println!(
-                    "[stats] requests={requests} errors={errors} kept={kept} filtered={filtered} elapsed_ms={elapsed_ms} rps={rps:.2}"
-                );
+            Event::Stats { .. } => {
+                if let Some(line) = event.stats_line() {
+                    println!("{line}");
+                }
             }
         }
     }

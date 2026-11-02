@@ -145,12 +145,35 @@ impl Engine {
         target: &T,
         selector: &Selector,
         calibration: &Calibration,
-        mut emit: C,
+        emit: C,
     ) -> Result<RunReport, EngineError>
     where
         I: Iterator<Item = std::io::Result<WordSet>>,
         T: Target,
         C: FnMut(Event),
+    {
+        self.run_observed(words, target, selector, calibration, emit, |_, _, _| {})
+            .await
+    }
+
+    /// Like [`Engine::run`], but also reports every candidate outcome to an
+    /// observer. `kept` is true when the result passed the target, selector and
+    /// calibration filters. Observers are used by orchestration layers (for
+    /// example the DNS repair sweep) without changing lookup behaviour.
+    pub async fn run_observed<I, T, C, O>(
+        &self,
+        words: I,
+        target: &T,
+        selector: &Selector,
+        calibration: &Calibration,
+        mut emit: C,
+        mut observe: O,
+    ) -> Result<RunReport, EngineError>
+    where
+        I: Iterator<Item = std::io::Result<WordSet>>,
+        T: Target,
+        C: FnMut(Event),
+        O: FnMut(&WordSet, &Result<ExecResult, EngineError>, bool),
     {
         let started = Instant::now();
         let mut stats = RunStats::default();
@@ -176,17 +199,21 @@ impl Engine {
                 WorkItem::Done(words, report) => {
                     stats.requests += u64::from(report.attempts);
                     stats.errors += u64::from(report.failed);
-                    if let Ok(result) = report.result {
-                        let keep = target.keep_result(&words, &result)
+                    let kept = if let Ok(result) = &report.result {
+                        let keep = target.keep_result(&words, result)
                             && selector.keep(&result.response)
                             && !calibration.matches(&result.response);
                         if keep {
                             stats.kept += 1;
-                            emit(Event::result(&words, &result));
+                            emit(Event::result(&words, result));
                         } else {
                             stats.filtered += 1;
                         }
-                    }
+                        keep
+                    } else {
+                        false
+                    };
+                    observe(&words, &report.result, kept);
                 }
             }
         }

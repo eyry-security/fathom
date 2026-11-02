@@ -30,6 +30,7 @@ use crate::calibration::Calibration;
 use crate::engine::{Engine, Target};
 use crate::matcher::Selector;
 use crate::output::Event;
+use crate::repair::RepairSweepStats;
 use crate::types::{EngineError, ExecResult, Response};
 use crate::wordlist::WordSet;
 
@@ -78,6 +79,8 @@ pub struct DnsRunStats {
     pub per_type: BTreeMap<String, DnsTypeTotals>,
     #[serde(default)]
     pub rcodes: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep: Option<RepairSweepStats>,
 }
 
 impl DnsRunStats {
@@ -90,6 +93,13 @@ impl DnsRunStats {
         }
         for (rcode, count) in &other.rcodes {
             *self.rcodes.entry(rcode.clone()).or_insert(0) += count;
+        }
+        if let Some(other_sweep) = other.sweep {
+            let sweep = self.sweep.get_or_insert_default();
+            sweep.subset += other_sweep.subset;
+            sweep.attempts += other_sweep.attempts;
+            sweep.recovered += other_sweep.recovered;
+            sweep.passes = sweep.passes.max(other_sweep.passes);
         }
     }
 }
@@ -734,6 +744,21 @@ pub fn payload_from_info(info: &serde_json::Value) -> Option<DnsPayload> {
     info.get("dns")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
+}
+
+/// True when a candidate still needs another resolver pass: either a partial
+/// answer left at least one record type incomplete, or every lookup failed.
+pub fn result_is_incomplete(result: &Result<ExecResult, EngineError>) -> bool {
+    match result {
+        Ok(result) => payload_from_info(&result.info)
+            .is_some_and(|payload| !payload.incomplete_types.is_empty()),
+        Err(_) => true,
+    }
+}
+
+/// Host carried by a DNS result, if the payload is well-formed.
+pub fn result_host(result: &ExecResult) -> Option<String> {
+    payload_from_info(&result.info).map(|payload| payload.host)
 }
 
 /// Translate a discovered host into one line of Vedette input: a bare host, or
