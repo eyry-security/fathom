@@ -102,3 +102,59 @@ $ fathom dns -d example.com -w subs.txt --emit-hosts --emit-port 8443
 www.example.com:8443
 api.example.com:8443
 ```
+
+## resolver-bench
+
+The repo also builds `resolver-bench` (`src/bin/resolver-bench.rs`), a standalone
+DNS resolver vetting tool. Point it at a truth file of hosts that must resolve;
+it grades each resolver on correctness, latency, and error growth under load:
+
+- **Correctness** — every truth host must resolve, and generated
+  `nx<random>.<domain>` labels must not. A missing host and an invented answer
+  both count as wrong; an invented answer sets the wildcard flag.
+- **Latency** — A-query median and p95 at low concurrency.
+- **Error growth** — a sustained burst through a closed Fathom-like concurrency
+  window, reported as an overall error rate and in 10 time buckets. Late growth
+  past the early rate marks the resolver `DEGRADED`.
+
+A resolver that returns any wrong answer, or exceeds a 5% burst error rate,
+gets a `FAIL` verdict. Reports are ranked by wrong answers, then burst error
+rate, then p95. Every built-in and custom resolver carries an operator name.
+
+`--truth` is required. `--domains` defaults to `example.com,eyry.io`,
+`--concurrency` to 256, `--burst` to 2000, and `--queries` to 50. Without
+`--resolvers`, it uses a built-in set of public resolvers.
+
+```sh
+# truth.txt: one host per line that must resolve
+$ cat truth.txt
+example.com
+www.example.com
+
+# Built-in resolvers, one probe domain
+$ cargo run --bin resolver-bench -- --truth truth.txt --domains example.com
+
+# Explicit resolvers (`name,ip` per line) and a JSON report
+$ cat resolvers.txt
+Cloudflare,1.1.1.1
+Google,8.8.8.8
+
+$ cargo run --bin resolver-bench -- \
+    --truth truth.txt --domains example.com \
+    --resolvers resolvers.txt --json report.json
+```
+
+`--timeout` accepts values like `1s` or `500ms`; `--json` writes the full
+per-resolver metrics: correctness, latency, burst buckets, and verdict.
+
+## The DNS trio
+
+Magpie builds per-target lists from a target's own site and hands them to
+Fathom. Fathom's tiered lists merge 10 public corpora, ranked by cross-corpus
+frequency at 10k / 50k / ~500k practical cuts. On a large public bug bounty
+program, the 50k tier found 30 more verified hosts than the standard bitquark
+top-100k baseline; the 500k cut found 91 more. Every claimed host was
+independently verified: 100% precision across all benchmark runs.
+`resolver-bench` vets the resolvers; Fathom runs the list.
+
+Magpie: https://github.com/eyry-security/magpie
